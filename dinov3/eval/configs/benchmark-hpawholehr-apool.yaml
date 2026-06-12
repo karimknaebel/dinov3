@@ -1,0 +1,54 @@
+# HPAWholeHR attention-pooling benchmark (crop 512, self-norm transform).
+#
+# Trains a 4-block attention-pooling probe on the class-balanced split
+# (BAL_TRAIN), validates on VAL (labeled), and runs on the Kaggle TEST split
+# at the end. TEST has no public labels; predictions are saved (save_results:
+# true) for external scoring via dinov3/eval/hpa_kaggle_submission.py.
+#
+# 6-LR sweep selects the best run by MEAN_PER_CLASS_MULTILABEL_F1 on VAL.
+#
+# transform.use_bio_transform: true → Div255 → CenterCrop → SelfNormalizeNoDiv.
+#
+# Run a single eval directly:
+#
+#   PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/eval/attention_pooling.py \
+#       --config-file dinov3/eval/configs/benchmark-hpawholehr-apool.yaml \
+#       --output-dir <PATH/TO/OUTPUT/DIR> \
+#       model.config_file=<TRAIN/OUTPUT>/config.yaml \
+#       model.pretrained_weights=<TRAIN/OUTPUT>/eval/<ITER>/teacher_checkpoint.pth
+
+train:
+  dataset: "HPAWholeHR:split=BAL_TRAIN:with_metadata=false"
+  val_dataset: "HPAWholeHR:split=VAL:with_metadata=false"
+  batch_size: 32
+  optimizer_type: ADAMW
+  loss_type: BINARY_CROSS_ENTROPY
+  epoch_length: 145
+  epochs: 30
+  n_last_blocks_list:
+    - 4
+  cls_patch: false
+  embed_dim: 512
+  num_heads: 8
+  reload_best_for_eval: true
+  learning_rates:
+    - 1.0e-4
+    - 5.0e-4
+    - 1.0e-3
+    - 5.0e-3
+    - 1.0e-2
+    - 5.0e-2
+  val_metric_type: MEAN_PER_CLASS_MULTILABEL_F1
+
+eval:
+  test_datasets:
+    - "HPAWholeHR:split=TEST:with_metadata=false"
+  test_metric_types:
+    - MEAN_PER_CLASS_MULTILABEL_F1
+
+transform:
+  use_bio_transform: true
+  resize_size: 0
+  crop_size: 512
+
+save_results: true

@@ -42,6 +42,17 @@ ibot:
   head_norm_last_layer: false
   head_nlayers: 3
   head_hidden_dim: 2048
+sigreg:
+  # Spectral Independence Gradient Regularization on the student DINO-head bottleneck.
+  # Only the 'bottleneck' mode is supported.
+  # When enabled, replaces KoLeo on the CLS pre-head unless koleo_too is true.
+  enabled: false
+  mode: bottleneck
+  loss_weight: 0.05
+  num_slices: 1024
+  range_max: 5.0
+  n_knots: 17
+  koleo_too: false  # If true, also apply the standard KoLeo loss alongside SIGReg.
 gram:
   use_loss: false # (bool) if true gram is used, else not
   compute_stats: false # (bool): if true compute auxilliary stats
@@ -81,6 +92,7 @@ train:
   cudagraphs: false
   sharded_eval_checkpoint: false
   cache_dataset: false
+  cell_augmentation_type: null  # null | "hpa" (4-channel cellular pipeline: self-norm + protein-channel-aware jitter).
 student:
   arch: vit_large
   patch_size: 16
@@ -145,6 +157,35 @@ optim:
   dump_fsdp_weights_path: ""
   adamw_beta1: 0.9
   adamw_beta2: 0.999
+  grad_norm_normalization: false  # Equalize gradient magnitudes across guide losses on the CLS pre-head (GuidedSSLMetaArch only).
+guide:
+  # Metadata-guided learning heads attached to the student's CLS pre-head embedding.
+  # Only consumed when MODEL.META_ARCHITECTURE == GuidedSSLMetaArch and enabled: true.
+  # Each dataset feeding a guided run must emit samples shaped (image, (target, metadata)),
+  # where metadata is a dataclass whose field names match each guide's `name`.
+  enabled: false
+  guides: []
+  # Example entry shape:
+  #   - name: sub_region           # field on the metadata dataclass
+  #     enabled: true
+  #     method: classification     # classification | regression | prototypical
+  #     hidden_dim: [512, 512, 256]
+  #     dropout: 0.5
+  #     loss_weight: 0.1
+  #     n_outputs: 12              # classes for classification, output dim for regression
+  #     grl: false                 # gradient reversal for adversarial debiasing
+  #     grl_space: embedding       # embedding | prototype
+  #     use_bce: false             # classification: multi-label BCE instead of CE
+  #     output_activation: none    # regression: none | sigmoid | tanh
+  #     target_normalization:      # regression: rescale targets to [0, 1]
+  #       output_min: null
+  #       output_max: null
+  #     proto_temperature: 0.07    # prototypical only
+  #     proto_centroid_momentum: 0.999
+  #     proto_phi_min: 0.01
+  lambda_schedule:
+    type: sigmoid  # sigmoid | linear | constant
+    warmup_iterations: 0
 crops:
   global_crops_scale:
   - 0.32
@@ -160,6 +201,8 @@ crops:
   localcrops_subset_of_globalcrops: false
   share_color_jitter: false
   horizontal_flips: true
+  vertical_flips: false
+  gaussian_blur: true
   gram_teacher_no_distortions: false  # If True, no distortions are applied to gram teacher crops
   rgb_mean:
   - 0.485
@@ -173,7 +216,7 @@ crops:
 evaluation:
   eval_period_iterations: 12500
   low_freq_every: 5
-  config_files:  # Must be in fairvit/eval/configs
+  config_files:  # Must be in dinov3/eval/configs
     high_freq: benchmark_high_frequency.yaml  # More often
     low_freq: benchmark_low_frequency.yaml  # Less often
 checkpointing:

@@ -108,21 +108,41 @@ def get_params_groups_with_decay(model, lr_decay_rate=1.0, patch_embed_lr_mult=1
     return all_param_groups
 
 
-def fuse_params_groups(all_params_groups, keys=("lr_multiplier", "wd_multiplier", "is_last_layer")):
+def fuse_params_groups(
+    all_params_groups,
+    keys=("lr_multiplier", "wd_multiplier", "is_last_layer", "is_frozen_backbone", "always_frozen"),
+):
     fused_params_groups = defaultdict(lambda: {"params": []})
     for d in all_params_groups:
         identifier = ""
         for k in keys:
-            identifier += k + str(d[k]) + "_"
+            identifier += k + str(d.get(k, False)) + "_"
 
         for k in keys:
-            fused_params_groups[identifier][k] = d[k]
+            fused_params_groups[identifier][k] = d.get(k, False)
         fused_params_groups[identifier]["params"].append(d["params"])
 
     return fused_params_groups.values()
 
 
-def get_params_groups_with_decay_fsdp(model, lr_decay_rate=1.0, patch_embed_lr_mult=1.0, dino_head_wd_multiplier=1.0):
+def get_params_groups_with_decay_fsdp(
+    model,
+    lr_decay_rate=1.0,
+    patch_embed_lr_mult=1.0,
+    dino_head_wd_multiplier=1.0,
+    freeze_patch_embed=True,
+    freeze_cls_token=True,
+    freeze_mask_token=True,
+    unfreeze_last_n_blocks=0,
+):
+    """Build per-parameter groups for an FSDP-wrapped submodule.
+
+    The ``freeze_*`` and ``unfreeze_last_n_blocks`` knobs annotate backbone
+    params with ``is_frozen_backbone`` and ``always_frozen`` flags, which the
+    training loop honors via ``apply_optim_scheduler`` to implement two-stage
+    finetuning. Defaults preserve the no-freeze case so callers that don't
+    pass these knobs behave identically to before.
+    """
     if hasattr(model, "module"):  # SimpleFSDP
         is_backbone = hasattr(model.module, "blocks")
         n_blocks = len(model.module.blocks) if is_backbone else 0
@@ -147,6 +167,8 @@ def get_params_groups_with_decay_fsdp(model, lr_decay_rate=1.0, patch_embed_lr_m
             "name": name,
             "params": param,
             "is_last_layer": False,
+            "is_frozen_backbone": False,
+            "always_frozen": False,
             "lr_multiplier": decay_rate,
             "wd_multiplier": 1.0,
         }
@@ -164,8 +186,33 @@ def get_params_groups_with_decay_fsdp(model, lr_decay_rate=1.0, patch_embed_lr_m
         if "patch_embed" in name:
             d["lr_multiplier"] *= patch_embed_lr_mult
 
+        # Two-stage finetune flags only apply to backbone submodules; non-backbone
+        # submodules (dino_head, guide heads) leave both flags False.
+        if is_backbone:
+            is_patch_embed = "patch_embed" in name
+            is_cls_token = name.endswith("cls_token")
+            is_mask_token = name.endswith("mask_token")
+            gated_off = (
+                (is_patch_embed and not freeze_patch_embed)
+                or (is_cls_token and not freeze_cls_token)
+                or (is_mask_token and not freeze_mask_token)
+            )
+            if not gated_off:
+                d["is_frozen_backbone"] = True
+
+            if unfreeze_last_n_blocks > 0:
+                if "blocks." in name:
+                    block_idx = int(name.split("blocks.")[1].split(".")[0])
+                    if block_idx < n_blocks - unfreeze_last_n_blocks:
+                        d["always_frozen"] = True
+                else:
+                    d["always_frozen"] = True
+
         all_param_groups.append(d)
-        logger.info(f"{name}: lr_multiplier: {d['lr_multiplier']}, wd_multiplier: {d['wd_multiplier']}")
+        logger.info(
+            f"{name}: lr_multiplier: {d['lr_multiplier']}, wd_multiplier: {d['wd_multiplier']}, "
+            f"is_frozen_backbone: {d['is_frozen_backbone']}, always_frozen: {d['always_frozen']}"
+        )
 
     return all_param_groups
 

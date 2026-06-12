@@ -5,6 +5,8 @@
 
 from .ade20k import ADE20K
 from .coco_captions import CocoCaptions
+from .fmow import FMoW
+from .hpa_whole_hr import HPAWholeHR
 from .image_net import ImageNet
 from .image_net_22k import ImageNet22k
 from .nyu import NYU

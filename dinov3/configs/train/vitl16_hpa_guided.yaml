@@ -1,0 +1,325 @@
+# Two-stage metadata-guided DINOv3 finetune on HPA-WholeHR.
+#
+# Single-guide reference recipe (antibody prototypical) on 4-channel HPA stains,
+# with SIGReg on the DINO-head bottleneck and gradient-norm normalization.
+#
+# Warm-starts from a pretrained ViT-L teacher checkpoint expanded to 4 channels
+# via `dinov3/utils/expand_patch_embed.py` (set
+# `student.resume_from_teacher_chkpt` below), then runs two-stage training:
+#   Stage 1 (iters 0 .. 10000): backbone frozen except patch_embed; only the
+#           SSL heads (dino_head, ibot_head, dino_head bottleneck for SIGReg)
+#           and the guide head receive gradients.
+#   Stage 2 (iters 10000 ..): backbone unfreezes with a 1000-iter linear LR
+#           ramp (backbone_warmup_after_freeze).
+#
+# Iteration mapping: OFFICIAL_EPOCH_LENGTH=1500 * optim.epochs=45 = 67500 iters.
+# warmup_iterations / freeze_last_layer_iterations / freeze_student_iterations /
+# backbone_warmup_after_freeze are all iteration-indexed.
+#
+# HPA-specific knobs:
+#   train.cell_augmentation_type: hpa  — uses RandomContrastProteinChannel,
+#     RandomRemoveChannelExceptProtein, RandomContrast, RandomBrightness in the
+#     SSL color-jitter slot and SelfNormalizeNoDiv in place of RGB normalize.
+#   student.in_chans / teacher.in_chans: 4 — must match the 4-channel-expanded
+#     pretrained checkpoint and the channel count emitted by HPAWholeHR.
+
+MODEL:
+  META_ARCHITECTURE: GuidedSSLMetaArch
+  DEVICE: cuda
+  WEIGHTS: ''
+  DTYPE: float32
+
+compute_precision:
+  param_dtype: bf16
+  reduce_dtype: fp32
+  sharding_strategy: SHARD_GRAD_OP
+
+dino:
+  loss_weight: 1.0
+  global_ignore_diagonal: true
+  head_n_prototypes: 65536
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 2048
+  koleo_loss_weight: 0.1     # ignored when sigreg.koleo_too=false.
+  koleo_loss_distributed: false
+  koleo_topk: 1
+  koleo_distributed_replicas: 0
+  koleo_distributed_loss_group_size: null
+  koleo_distributed_loss_group_data: true
+  force_weight_norm: false
+  reweight_dino_local_loss: false
+  local_loss_weight_schedule:
+    start: 0.5
+    peak: 0.5
+    end: 0.5
+    warmup_epochs: 0
+
+ibot:
+  loss_weight: 1.0
+  mask_sample_probability: 0.5
+  mask_ratio_min_max:
+  - 0.1
+  - 0.5
+  mask_random_circular_shift: false
+  force_masking_even_with_zero_weight: false
+  separate_head: true
+  head_n_prototypes: 65536
+  head_bottleneck_dim: 256
+  head_norm_last_layer: false
+  head_nlayers: 3
+  head_hidden_dim: 2048
+
+sigreg:
+  enabled: true
+  mode: bottleneck
+  loss_weight: 0.05
+  num_slices: 1024
+  range_max: 5.0
+  n_knots: 17
+  koleo_too: false
+
+gram:
+  use_loss: false
+  compute_stats: false
+  loss_weight: 1.0
+  ema_teacher: false
+  ckpt: null
+  it_load_ema_teacher: -1
+  rep_update: true
+  update_frequency: 50000
+  it_first_update: 0
+  max_updates: null
+  normalized: true
+  img_level: false
+  remove_neg: false
+  remove_only_teacher_neg: false
+  tokens_used: all
+  global_teacher_resize_method: bicubic
+  global_teacher_resize_antialias: false
+  loss_weight_schedule: null
+
+guide:
+  enabled: true
+  lambda_schedule:
+    type: sigmoid
+    warmup_iterations: 0
+  # Single enabled guide: antibody (guiding_labels) prototypical contrastive head.
+  # The other two entries are kept disabled but listed for reference.
+  guides:
+  - name: guiding_labels
+    enabled: true
+    method: prototypical
+    hidden_dim: [512, 512, 256]
+    dropout: 0.5
+    loss_weight: 0.1
+    n_outputs: 12493
+    grl: false
+    grl_space: embedding
+    use_bce: false
+    output_activation: none
+    target_normalization:
+      output_min: null
+      output_max: null
+    proto_temperature: 0.02333
+    proto_centroid_momentum: 0.999
+    proto_phi_min: 0.01
+  - name: environment_labels
+    enabled: false
+    method: classification
+    hidden_dim: [512, 512, 256]
+    dropout: 0.5
+    loss_weight: 0.03
+    n_outputs: 1457
+    grl: false
+    grl_space: embedding
+    use_bce: false
+    output_activation: none
+    target_normalization:
+      output_min: null
+      output_max: null
+    proto_temperature: 0.07
+    proto_centroid_momentum: 0.999
+    proto_phi_min: 0.01
+  - name: secondary_technical_labels
+    enabled: false
+    method: classification
+    hidden_dim: [512, 512, 256]
+    dropout: 0.5
+    loss_weight: 0.01
+    n_outputs: 35
+    grl: false
+    grl_space: embedding
+    use_bce: false
+    output_activation: none
+    target_normalization:
+      output_min: null
+      output_max: null
+    proto_temperature: 0.07
+    proto_centroid_momentum: 0.999
+    proto_phi_min: 0.01
+
+train:
+  batch_size_per_gpu: 96
+  dataset_path: HPAWholeHR:split=TRAIN_SSL:with_metadata=true
+  output_dir: <OUTPUT/DIR>
+  seed: 0
+  num_workers: 10
+  OFFICIAL_EPOCH_LENGTH: 1500
+  monitor_gradient_norm: false
+  chunk_schedule: []
+  cache_dataset: true
+  cell_augmentation_type: hpa
+  use_teacher_head: true
+  learn_from_teacher_tokens: false
+  centering: sinkhorn_knopp
+  checkpointing: true
+  checkpointing_full: true
+  compile: true
+  cudagraphs: false
+  sharded_eval_checkpoint: false
+
+student:
+  arch: vit_large
+  patch_size: 16
+  drop_path_rate: 0.1
+  layerscale: 1.0e-05
+  pretrained_weights: ''
+  ffn_layer: mlp
+  ffn_ratio: 4.0
+  # Warm-start: the .pth file at this path is loaded into student weights and
+  # also copied into model_ema before training begins. Point this at a
+  # 4-channel-expanded ViT-L teacher checkpoint (see
+  # `dinov3/utils/expand_patch_embed.py`).
+  resume_from_teacher_chkpt: <PATH/TO/PRETRAINED/TEACHER_4CH.pth>
+  qkv_bias: true
+  proj_bias: true
+  ffn_bias: true
+  norm_layer: layernorm
+  n_storage_tokens: 4
+  untie_cls_and_patch_norms: false
+  untie_global_and_local_cls_norm: false
+  mask_k_bias: false
+  in_chans: 4
+  pos_embed_type: ropenew
+  pos_embed_rope_base: 100.0
+  pos_embed_rope_min_period: null
+  pos_embed_rope_max_period: null
+  pos_embed_rope_normalize_coords: separate
+  pos_embed_rope_shift_coords: null
+  pos_embed_rope_jitter_coords: null
+  pos_embed_rope_rescale_coords: 2.0
+  pos_embed_rope_dtype: bf16
+  fp8_enabled: false
+  fp8_filter: blocks
+
+teacher:
+  momentum_teacher: 0.994
+  final_momentum_teacher: 1.0
+  warmup_teacher_temp: 0.04
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 0
+  in_chans: 4
+
+distillation:
+  enabled: false
+  full_cfg_path: ''
+  checkpoint_path: ''
+
+multidistillation:
+  enabled: false
+
+hrft:
+  enabled: false
+  checkpoint_path: ''
+
+optim:
+  epochs: 45
+  optimizer: adamw
+  weight_decay: 0.04
+  weight_decay_end: 0.04
+  lr: 5.0e-05            # Ignored when schedules.lr is set (v2 takes precedence).
+  warmup_epochs: 0
+  min_lr: 5.0e-05
+  schedule_trunc_extra: 0.0
+  clip_grad: 3.0
+  freeze_last_layer_epochs: 0
+  scaling_rule: sqrt_wrt_1024
+  patch_embed_lr_mult: 0.2
+  dino_head_wd_multiplier: 1.0
+  layerwise_decay: 0.9
+  multi_tensor_optim: true
+  dump_fsdp_weights_path: ''
+  adamw_beta1: 0.9
+  adamw_beta2: 0.999
+  grad_norm_normalization: true
+
+crops:
+  # HPA whole-cell images are large and high-resolution: global crops 0.4-1.0,
+  # local crops 0.005-0.4.
+  global_crops_scale:
+  - 0.4
+  - 1.0
+  local_crops_number: 8
+  local_crops_scale:
+  - 0.005
+  - 0.4
+  global_crops_size: 576
+  local_crops_size: 288
+  global_local_crop_pairs_ratios: 1.0
+  gram_teacher_crops_size: null
+  localcrops_subset_of_globalcrops: false
+  share_color_jitter: false
+  horizontal_flips: true
+  vertical_flips: true
+  gaussian_blur: false
+  gram_teacher_no_distortions: false
+  # rgb_mean / rgb_std are ignored when train.cell_augmentation_type == "hpa".
+  rgb_mean: [0.485, 0.456, 0.406]
+  rgb_std: [0.229, 0.224, 0.225]
+  teacher_to_student_resolution_scale: 1.0
+
+evaluation:
+  eval_period_iterations: 2500
+  low_freq_every: 5
+  config_files:
+    high_freq: benchmark-hpawholehr-apool.yaml
+    low_freq: benchmark-hpawholehr-apool.yaml
+
+checkpointing:
+  period: 1500
+  max_to_keep: 2
+  keep_every: 99999999999999999
+
+# Schedules v2 (iteration-aware) — required for the two-stage finetune knobs.
+schedules:
+  lr:
+    start: 0.0
+    peak: 5.0e-05
+    end: 5.0e-05
+    warmup_iterations: 3000
+    freeze_last_layer_iterations: 450
+    cosine_iterations: 0             # peak == end, so the cosine reduces to a constant.
+    # Two-stage finetune: iteration-indexed (NOT scaled by OFFICIAL_EPOCH_LENGTH).
+    freeze_student_iterations: 10000
+    backbone_warmup_after_freeze: 1000
+    freeze_patch_embed: false
+    freeze_cls_token: true
+    freeze_mask_token: true
+    unfreeze_last_n_blocks: 0
+  weight_decay:
+    start: 0.04
+    peak: 0.04
+    end: 0.04
+    warmup_epochs: 0
+  momentum:
+    start: 0.994
+    peak: 0.994
+    end: 1.0
+    warmup_epochs: 0
+  teacher_temp:
+    start: 0.04
+    peak: 0.07
+    end: 0.07
+    warmup_epochs: 0

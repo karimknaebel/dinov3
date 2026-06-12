@@ -1,0 +1,48 @@
+# FMoW OOD attention-pooling benchmark (crop 224 / resize 256).
+#
+# OOD eval (temporal shift) sibling of the IID config.
+#
+# Run a single eval directly (no orchestrator):
+#
+#   PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/eval/attention_pooling.py \
+#       --config-file dinov3/eval/configs/benchmark-fmow-ood-apool.yaml \
+#       --output-dir <PATH/TO/OUTPUT/DIR> \
+#       model.config_file=<TRAIN/OUTPUT>/config.yaml \
+#       model.pretrained_weights=<TRAIN/OUTPUT>/eval/<ITER>/teacher_checkpoint.pth
+
+train:
+  dataset: "FMoW:split=TRAIN"
+  val_dataset: "FMoW:split=VAL_OOD"
+  batch_size: 32
+  optimizer_type: ADAMW
+  loss_type: CROSS_ENTROPY
+  epoch_length: 300
+  epochs: 5
+  n_last_blocks_list:
+    - 4
+  cls_patch: false
+  embed_dim: 512
+  num_heads: 8
+  learning_rates:
+    - 1.0e-4
+    - 5.0e-4
+    - 1.0e-3
+    - 5.0e-3
+    - 1.0e-2
+    - 5.0e-2
+    - 0.1
+    - 0.5
+    - 1.0
+  val_metric_type: WORST_GROUP_ACCURACY
+
+eval:
+  test_datasets:
+    - "FMoW:split=TEST_OOD"
+  test_metric_types:
+    - WORST_GROUP_ACCURACY
+
+transform:
+  resize_size: 256
+  crop_size: 224
+
+save_results: true

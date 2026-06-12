@@ -5,7 +5,7 @@
 
 import logging
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -45,6 +45,7 @@ class ClassificationMetricType(Enum):
     IMAGENET_C_METRIC = "imagenet_c_metric"
     MACRO_AVERAGED_MEAN_RECIPROCAL_RANK = "macro_averaged_mean_reciprocal_rank"
     MACRO_MULTILABEL_AVERAGE_PRECISION = "macro_multilabel_average_precision"
+    WORST_GROUP_ACCURACY = "worst_group_accuracy"
 
     @property
     def averaging_method(self):
@@ -93,7 +94,13 @@ def _make_default_ks(num_classes: int):
 
 
 def build_classification_metric(
-    metric_type: ClassificationMetricType, *, num_classes: int, ks: Optional[tuple] = None, dataset=None
+    metric_type: ClassificationMetricType,
+    *,
+    num_classes: int,
+    ks: Optional[tuple] = None,
+    dataset=None,
+    num_groups: Optional[int] = None,
+    group_names: Optional[List[str]] = None,
 ):
     if metric_type.is_topk_accuracy_metric:
         ks = ks or _make_default_ks(num_classes)
@@ -135,6 +142,16 @@ def build_classification_metric(
         )
     elif metric_type == ClassificationMetricType.MACRO_AVERAGED_MEAN_RECIPROCAL_RANK:
         return MetricCollection({"top-1": MacroAveragedMeanReciprocalRank(num_classes=int(num_classes))})
+    elif metric_type == ClassificationMetricType.WORST_GROUP_ACCURACY:
+        return MetricCollection(
+            {
+                "top-1": WorstGroupAccuracy(
+                    num_classes=int(num_classes),
+                    num_groups=num_groups,
+                    group_names=group_names,
+                )
+            }
+        )
     raise ValueError(f"Unknown metric type {metric_type}")
 
 
@@ -313,6 +330,56 @@ class MacroAveragedMeanReciprocalRank(Metric):
 
     def compute(self) -> Tensor:
         return (self.per_class_mrr / (self.per_class_num_samples + 1e-6)).mean()
+
+
+class WorstGroupAccuracy(Metric):
+    """Compute accuracy for each defined group and return the minimum."""
+
+    is_differentiable: bool = False
+    higher_is_better: bool = True
+    full_state_update: bool = False
+
+    def __init__(
+        self,
+        num_classes: int,
+        num_groups: Optional[int] = None,
+        group_names: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.num_classes = num_classes
+        n = num_groups if num_groups is not None else num_classes
+        self.num_groups = n
+        self.group_names = group_names or [f"Group {i}" for i in range(n)]
+        self.add_state("correct", default=torch.zeros(n, dtype=torch.long), dist_reduce_fx="sum")
+        self.add_state("total", default=torch.zeros(n, dtype=torch.long), dist_reduce_fx="sum")
+
+    def update(self, preds: Tensor, target: Tensor, groups: Optional[Tensor] = None, **kwargs) -> None:
+        pred_labels = preds.argmax(dim=1)
+        correct_mask = pred_labels == target
+        keys = groups if groups is not None else target
+        for g in keys.unique():
+            mask = keys == g
+            self.correct[g] += correct_mask[mask].sum()
+            self.total[g] += mask.sum()
+
+    def compute(self) -> Tensor:
+        acc = self.correct.float() / self.total.float().clamp(min=1)
+        active = self.total > 0
+        if active.any():
+            rows = sorted(
+                [
+                    (self.group_names[i], acc[i].item(), self.total[i].item())
+                    for i in range(self.num_groups)
+                    if active[i]
+                ],
+                key=lambda t: t[1],
+            )
+            header = f"{'group':<20s} {'accuracy':>8s} {'nb of samples':>8s}"
+            lines = [header] + [f"{name:<20s} {100.0 * a:7.2f}% {int(cnt):>8d}" for name, a, cnt in rows]
+            logger.info("Per-group accuracy:\n" + "\n".join(lines))
+            return acc[active].min()
+        return acc.min()
 
 
 def accuracy(output, target, topk=(1,)):

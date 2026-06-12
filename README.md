@@ -1,4 +1,6 @@
-:new: [2026-03-10] :fire: The [Canopy Height Maps v2 (CHMv2) model](https://arxiv.org/abs/2603.06382) and inference code are now available (more details on downloading the model weights and using the code [here](#canopy-height-maps-v2-chmv2)). The model weights are also available in [Hugging Face Hub](https://huggingface.co/facebook/dinov3-vitl16-chmv2-dpt-head) and [supported](https://github.com/huggingface/transformers/blob/main/docs/source/en/model_doc/chmv2.md) by the Hugging Face [Transformers](https://huggingface.co/docs/transformers/index) library. Building on our original high-resolution canopy height maps released in 2024, CHMv2 delivers substantial improvements in accuracy, detail, and global consistency by leveraging DINOv3.
+:new: [2026-06-12] :fire: Metadata-guided training code and reference recipes (FMoW satellite imagery, HPA-WholeHR fluorescence imagery) are now released, accompanying [*Who Needs Labels? Adapting Vision Foundation Models With the Metadata You Already Have*](https://arxiv.org/abs/2606.05107) (Gardès et al., 2026). Jump to the [Metadata-Guided Training](#metadata-guided-training) section.
+
+[2026-03-10] The [Canopy Height Maps v2 (CHMv2) model](https://arxiv.org/abs/2603.06382) and inference code are now available (more details on downloading the model weights and using the code [here](#canopy-height-maps-v2-chmv2)). The model weights are also available in [Hugging Face Hub](https://huggingface.co/facebook/dinov3-vitl16-chmv2-dpt-head) and [supported](https://github.com/huggingface/transformers/blob/main/docs/source/en/model_doc/chmv2.md) by the Hugging Face [Transformers](https://huggingface.co/docs/transformers/index) library. Building on our original high-resolution canopy height maps released in 2024, CHMv2 delivers substantial improvements in accuracy, detail, and global consistency by leveraging DINOv3.
 
 [2025-11-20] Distillation code and configurations for ConvNeXt backbones are now released!
 
@@ -710,6 +712,34 @@ PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/train/train.py \
   train.dataset_path=<DATASET>:root=<PATH/TO/DATASET>:extra=<PATH/TO/DATASET>
 ```
 
+## Metadata-Guided Training
+
+Adapt a pretrained DINOv3 backbone to a new domain while *guiding* (or
+*adversarially debiasing*) the student CLS embedding using per-sample
+metadata: country, year, sensor angle, etc.
+
+This is the method introduced in [*Who Needs Labels? Adapting Vision
+Foundation Models With the Metadata You Already
+Have*](https://arxiv.org/abs/2606.05107) (Gardès et al., 2026) — see
+[citation block](#citing-metadata-guided-dinov3) below.
+
+All experiments described in `dinov3/train/metadata_utils/` were conducted
+starting from the **LVD ViT-L/16** checkpoint above; that is the default
+warm-start for any guided run unless otherwise noted.
+
+A reference run on the [Functional Map of the World (FMoW)](https://github.com/fMoW/dataset)
+dataset combines:
+
+- two metadata guides (sub-region as auxiliary, year as adversarial via GRL),
+- SIGReg on the DINO-head bottleneck,
+- gradient-norm equalization of the guide losses,
+- a two-stage finetune (backbone frozen, then linear LR ramp).
+
+See [`dinov3/train/metadata_utils/README.md`](dinov3/train/metadata_utils/README.md)
+for the full contract (dataset shape, config schema, plugging in your own
+dataset, channel-count surgery via `dinov3/utils/expand_patch_embed.py`, and
+the manual eval CLI for FMoW attention pooling).
+
 ## Evaluation
 
 The training code regularly saves the teacher weights. In order to evaluate the model, run the following evaluation on a single node:
@@ -878,5 +908,23 @@ If you find this repository useful, please consider giving a star :star: and cit
   archivePrefix={arXiv},
   primaryClass={cs.CV},
   url={https://arxiv.org/abs/2508.10104},
+}
+```
+
+## Citing Metadata-Guided DINOv3
+
+If you use the metadata-guided training code under
+`dinov3/train/metadata_utils/` or either of the FMoW / HPA reference
+recipes, please also cite:
+
+```
+@misc{gardès2026needslabelsadaptingvision,
+  title={Who Needs Labels? Adapting Vision Foundation Models With the Metadata You Already Have},
+  author={Elouan Gardès and Seung Eun Yi and Kartik Ahuja and Théo Moutakanni and Huy V. Vo and Piotr Bojanowski and Wolfgang M. Pernice and Loïc Landrieu and Camille Couprie},
+  year={2026},
+  eprint={2606.05107},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV},
+  url={https://arxiv.org/abs/2606.05107},
 }
 ```

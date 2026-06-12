@@ -15,6 +15,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed
+from omegaconf import DictConfig
 from torch.distributed._tensor import DTensor
 
 import dinov3.distributed as distributed
@@ -37,6 +38,7 @@ from dinov3.data import (
 )
 from dinov3.logging import MetricLogger, setup_logging
 from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosine_decay
+from dinov3.train.guided_ssl_meta_arch import GuidedSSLMetaArch
 from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
 from dinov3.train.ssl_meta_arch import SSLMetaArch
 
@@ -157,6 +159,23 @@ def build_schedulers_v2(cfg):
     total_iterations = cfg.train.OFFICIAL_EPOCH_LENGTH * cfg.optim.epochs
     logger.info(f"Total training iterations {total_iterations}")
 
+    def _iters(sched, name: str, default_epochs_field: str | None = None) -> int | None:
+        """Resolve a duration to iterations.
+
+        Prefers ``<name>_iterations`` when present (matches iteration-indexed
+        recipe semantics); otherwise falls back to ``<default_epochs_field>``
+        × ``iter_per_epoch``. Returns ``None`` if neither is present and the
+        field is optional (e.g. ``cosine_iterations``).
+        """
+        iter_key = f"{name}_iterations"
+        if iter_key in sched:
+            return int(sched[iter_key])
+        if default_epochs_field is None:
+            return None
+        if default_epochs_field not in sched:
+            return None
+        return iter_per_epoch * int(sched[default_epochs_field])
+
     # LR scaling rules
     lr_peak = cfg.schedules.lr.peak
     lr_end = cfg.schedules.lr.end
@@ -179,61 +198,72 @@ def build_schedulers_v2(cfg):
         start=cfg.schedules.lr.start,
         peak=lr_peak,
         end=lr_end,
-        warmup_iterations=iter_per_epoch * cfg.schedules.lr.warmup_epochs,
+        warmup_iterations=_iters(cfg.schedules.lr, "warmup", "warmup_epochs"),
         total_iterations=total_iterations,
-        cosine_iterations=(
-            iter_per_epoch * cfg.schedules.lr.cosine_epochs if "cosine_epochs" in cfg.schedules.lr else None
-        ),
+        cosine_iterations=_iters(cfg.schedules.lr, "cosine", "cosine_epochs"),
     )
     last_layer_lr = lr.copy()
-    last_layer_lr[: iter_per_epoch * cfg.schedules.lr.freeze_last_layer_epochs] = 0
+    freeze_last_layer = _iters(cfg.schedules.lr, "freeze_last_layer", "freeze_last_layer_epochs") or 0
+    last_layer_lr[:freeze_last_layer] = 0
     weight_decay = linear_warmup_cosine_decay(
         start=cfg.schedules.weight_decay.start,
         peak=cfg.schedules.weight_decay.peak,
         end=cfg.schedules.weight_decay.end,
-        warmup_iterations=iter_per_epoch * cfg.schedules.weight_decay.warmup_epochs,
+        warmup_iterations=_iters(cfg.schedules.weight_decay, "warmup", "warmup_epochs"),
         total_iterations=total_iterations,
-        cosine_iterations=(
-            iter_per_epoch * cfg.schedules.weight_decay.cosine_epochs
-            if "cosine_epochs" in cfg.schedules.weight_decay
-            else None
-        ),
+        cosine_iterations=_iters(cfg.schedules.weight_decay, "cosine", "cosine_epochs"),
     )
     momentum = linear_warmup_cosine_decay(
         start=cfg.schedules.momentum.start,
         peak=cfg.schedules.momentum.peak,
         end=cfg.schedules.momentum.end,
-        warmup_iterations=iter_per_epoch * cfg.schedules.momentum.warmup_epochs,
+        warmup_iterations=_iters(cfg.schedules.momentum, "warmup", "warmup_epochs"),
         total_iterations=total_iterations,
-        cosine_iterations=(
-            iter_per_epoch * cfg.schedules.momentum.cosine_epochs if "cosine_epochs" in cfg.schedules.momentum else None
-        ),
+        cosine_iterations=_iters(cfg.schedules.momentum, "cosine", "cosine_epochs"),
     )
     teacher_temp = linear_warmup_cosine_decay(
         start=cfg.schedules.teacher_temp.start,
         peak=cfg.schedules.teacher_temp.peak,
         end=cfg.schedules.teacher_temp.end,
-        warmup_iterations=iter_per_epoch * cfg.schedules.teacher_temp.warmup_epochs,
+        warmup_iterations=_iters(cfg.schedules.teacher_temp, "warmup", "warmup_epochs"),
         total_iterations=total_iterations,
-        cosine_iterations=(
-            iter_per_epoch * cfg.schedules.teacher_temp.cosine_epochs
-            if "cosine_epochs" in cfg.schedules.teacher_temp
-            else None
-        ),
+        cosine_iterations=_iters(cfg.schedules.teacher_temp, "cosine", "cosine_epochs"),
     )
     return lr, weight_decay, momentum, teacher_temp, last_layer_lr
 
 
-def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
+def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr, backbone_frozen=False, backbone_lr_scale=1.0):
+    """Apply per-step LR/WD to the optimizer.
+
+    Two-stage finetune semantics:
+      - ``always_frozen``: LR and WD pinned to 0 forever (early blocks when
+        ``unfreeze_last_n_blocks > 0``).
+      - ``is_frozen_backbone``: LR and WD pinned to 0 while ``backbone_frozen``
+        is True (stage 1); during the post-unfreeze ramp, backbone LR is
+        scaled by ``backbone_lr_scale`` (0 -> 1 linear over
+        ``backbone_warmup_after_freeze`` iters).
+
+    Backward-compatible: with defaults ``backbone_frozen=False`` and
+    ``backbone_lr_scale=1.0`` plus all groups having both flags falsy, behavior
+    matches the pre-port path.
+    """
     for param_group in optimizer.param_groups:
+        if param_group.get("always_frozen", False):
+            param_group["lr"] = 0.0
+            param_group["weight_decay"] = 0.0
+            continue
+        is_backbone = param_group.get("is_frozen_backbone", False)
+        if backbone_frozen and is_backbone:
+            param_group["lr"] = 0.0
+            param_group["weight_decay"] = 0.0
+            continue
+        scale = backbone_lr_scale if is_backbone else 1.0
         is_last_layer = param_group["is_last_layer"]
         lr_multiplier = param_group["lr_multiplier"]
         wd_multiplier = param_group["wd_multiplier"]
-        param_group["weight_decay"] = wd * wd_multiplier
-        if is_last_layer:
-            param_group["lr"] = last_layer_lr * lr_multiplier
-        else:
-            param_group["lr"] = lr * lr_multiplier
+        param_group["weight_decay"] = wd * wd_multiplier * scale
+        base_lr = last_layer_lr if is_last_layer else lr
+        param_group["lr"] = base_lr * lr_multiplier * scale
 
 
 def do_test(cfg, model, iteration, process_group, do_low_freq=False):
@@ -306,10 +336,17 @@ def build_data_loader_from_cfg(
     batch_size = dataloader_batch_size_per_gpu
     num_workers = cfg.train.num_workers
     dataset_path = cfg.train.dataset_path
+    # When guides are enabled, keep the (target, metadata) tuple so the collate
+    # fn can extract metadata; otherwise drop the target.
+    guide_enabled = "guide" in cfg and cfg.guide.enabled
+    if guide_enabled:
+        target_transform = lambda t: ((), t[1]) if isinstance(t, tuple) and len(t) > 1 else t
+    else:
+        target_transform = lambda _: ()
     dataset = make_dataset(
         dataset_str=dataset_path,
         transform=model.build_data_augmentation_dino(cfg),
-        target_transform=lambda _: (),
+        target_transform=target_transform,
     )
 
     if isinstance(dataset, torch.utils.data.IterableDataset):
@@ -451,6 +488,17 @@ def do_train(cfg, model, resume=False):
         num_gram_updates = math.ceil((start_iter + 1 - cfg.gram.it_first_update) / cfg.gram.update_frequency)
         logger.info(f"Gram was updated {num_gram_updates} times before iteration {start_iter}")
     consecutive_nan_count = 0
+    schedules_lr = getattr(getattr(cfg, "schedules", None), "lr", None)
+    freeze_iters = getattr(schedules_lr, "freeze_student_iterations", 0) if schedules_lr is not None else 0
+    backbone_warmup_after = (
+        getattr(schedules_lr, "backbone_warmup_after_freeze", 0) if schedules_lr is not None else 0
+    )
+    legacy_optim_lr = getattr(getattr(cfg, "optim", None), "lr", None)
+    if isinstance(legacy_optim_lr, (dict, DictConfig)) and getattr(legacy_optim_lr, "freeze_student_iterations", 0):
+        logger.warning(
+            "cfg.optim.lr.freeze_student_iterations is ignored; use cfg.schedules.lr.* instead."
+        )
+    prev_backbone_frozen: bool | None = None
     for data in metric_logger.log_every(
         data_loader,
         print_freq=10,
@@ -478,7 +526,27 @@ def do_train(cfg, model, resume=False):
         mom = momentum_schedule[it]
         teacher_temp = teacher_temp_schedule[it]
         last_layer_lr = last_layer_lr_schedule[it]
-        apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
+
+        backbone_frozen = model.is_student_frozen(it) if hasattr(model, "is_student_frozen") else False
+        if backbone_warmup_after > 0 and freeze_iters > 0 and freeze_iters <= it < freeze_iters + backbone_warmup_after:
+            backbone_lr_scale = (it - freeze_iters + 1) / backbone_warmup_after
+        else:
+            backbone_lr_scale = 1.0
+        if prev_backbone_frozen is not None and prev_backbone_frozen != backbone_frozen:
+            logger.info(
+                f"Backbone {'frozen' if backbone_frozen else 'unfrozen'} at iteration {it} "
+                f"(warmup steps remaining: {max(0, freeze_iters + backbone_warmup_after - it)})"
+            )
+        prev_backbone_frozen = backbone_frozen
+
+        apply_optim_scheduler(
+            optimizer,
+            lr,
+            wd,
+            last_layer_lr,
+            backbone_frozen=backbone_frozen,
+            backbone_lr_scale=backbone_lr_scale,
+        )
 
         # Forward backward
         optimizer.zero_grad(set_to_none=True)
@@ -548,6 +616,8 @@ def do_train(cfg, model, resume=False):
         metric_logger.update(wd=wd)
         metric_logger.update(mom=mom)
         metric_logger.update(last_layer_lr=last_layer_lr)
+        if freeze_iters > 0:
+            metric_logger.update(backbone_lr_scale=backbone_lr_scale)
         metric_logger.update(total_loss=total_loss, **metrics_dict)
 
         # Submit evaluation jobs
@@ -603,6 +673,7 @@ def main(argv=None):
     meta_arch = {
         "SSLMetaArch": SSLMetaArch,
         "MultiDistillationMetaArch": MultiDistillationMetaArch,
+        "GuidedSSLMetaArch": GuidedSSLMetaArch,
     }.get(cfg.MODEL.META_ARCHITECTURE, None)
     if meta_arch is None:
         raise ValueError(f"Unknown MODEL.META_ARCHITECTURE {cfg.MODEL.META_ARCHITECTURE}")
@@ -615,7 +686,7 @@ def main(argv=None):
     model._apply(
         lambda t: torch.full_like(
             t,
-            fill_value=math.nan if t.dtype.is_floating_point else (2 ** (t.dtype.itemsize * 8 - 1)),
+            fill_value=math.nan if t.dtype.is_floating_point else torch.iinfo(t.dtype).max,
             device="cuda",
         ),
         recurse=True,

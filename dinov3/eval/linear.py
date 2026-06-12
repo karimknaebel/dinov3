@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import time
+import dataclasses
 from dataclasses import dataclass, field
 from enum import Enum
 from functools import partial
@@ -32,7 +33,9 @@ from dinov3.data.adapters import DatasetWithEnumeratedTargets
 from dinov3.data.transforms import (
     CROP_DEFAULT_SIZE,
     RESIZE_DEFAULT_SIZE,
+    make_classification_eval_bio_transform,
     make_classification_eval_transform,
+    make_classification_train_bio_transform,
     make_classification_train_transform,
 )
 from dinov3.eval.data import create_train_dataset_dict, get_num_classes, pad_multilabel_and_collate
@@ -48,7 +51,7 @@ logger = logging.getLogger("dinov3")
 
 RESULTS_FILENAME = "results-linear.csv"
 # Can be several keys, depending on if multiple test sets are chosen and if doing few-shot
-MAIN_METRICS = [".*_accuracy(_mean)?"]
+MAIN_METRICS = [".*_accuracy(_mean)?", ".*_worst_group_accuracy"]
 
 
 class OptimizerType(Enum):
@@ -117,6 +120,7 @@ class EvalConfig:
 class TransformConfig:
     resize_size: int = RESIZE_DEFAULT_SIZE
     crop_size: int = CROP_DEFAULT_SIZE
+    use_bio_transform: bool = False  # Self-normalizing transform for multi-channel cellular images.
 
 
 @dataclass
@@ -234,12 +238,48 @@ def setup_linear_classifiers(sample_output, n_last_blocks_list, learning_rates, 
 
 
 def make_eval_transform(config: TransformConfig):
+    if config.use_bio_transform:
+        return make_classification_eval_bio_transform(
+            resize_size=config.resize_size, crop_size=config.crop_size,
+        )
     if config.resize_size / config.crop_size != 256 / 224:
         logger.warning(
             f"Default resize / crop ratio is 256 / 224, here we have {config.resize_size} / {config.crop_size}"
         )
     transform = make_classification_eval_transform(resize_size=config.resize_size, crop_size=config.crop_size)
     return transform
+
+
+def _region_collate(batch):
+    """Collate for WORST_GROUP_ACCURACY: pulls `region` off each sample's metadata.
+
+    Expects each item shaped ``(image, (index, (label, _Metadata)))`` (the output
+    of `DatasetWithEnumeratedTargets` over a metadata-emitting dataset like FMoW).
+    Returns ``(images, (index, labels), regions)`` so the eval loop can route the
+    region tensor as the `groups` kwarg to `WorstGroupAccuracy.update`.
+    """
+    from torch.utils.data.dataloader import default_collate
+
+    images, indices, labels, regions = [], [], [], []
+    for image, (index, target) in batch:
+        if isinstance(target, (tuple, list)):
+            label, meta = target[0], target[1]
+        else:
+            label, meta = target, None
+        images.append(image)
+        indices.append(index)
+        labels.append(label)
+        if not dataclasses.is_dataclass(meta) or not hasattr(meta, "region"):
+            raise ValueError(
+                f"_region_collate requires metadata with a 'region' attribute, but got {type(meta).__name__}"
+            )
+        regions.append(meta.region)
+
+    collated_images = default_collate(images)
+    collated_indices = default_collate(indices)
+    collated_labels = default_collate(labels)
+    collated_regions = torch.tensor(regions, dtype=torch.long)
+    return collated_images, (collated_indices, collated_labels), collated_regions
 
 
 def make_eval_data_loader(
@@ -257,6 +297,13 @@ def make_eval_data_loader(
     if hasattr(test_dataset, "get_imagenet_class_mapping"):
         class_mapping = test_dataset.get_imagenet_class_mapping()
 
+    if metric_type == ClassificationMetricType.ANY_MATCH_ACCURACY:
+        collate_fn = pad_multilabel_and_collate
+    elif metric_type == ClassificationMetricType.WORST_GROUP_ACCURACY:
+        collate_fn = _region_collate
+    else:
+        collate_fn = None
+
     test_data_loader = make_data_loader(
         dataset=DatasetWithEnumeratedTargets(test_dataset, pad_dataset=True, num_replicas=distributed.get_world_size()),
         batch_size=batch_size,
@@ -265,7 +312,7 @@ def make_eval_data_loader(
         drop_last=False,
         shuffle=False,
         persistent_workers=False,
-        collate_fn=pad_multilabel_and_collate if metric_type == ClassificationMetricType.ANY_MATCH_ACCURACY else None,
+        collate_fn=collate_fn,
     )
     return test_data_loader, class_mapping
 
@@ -289,7 +336,11 @@ class Evaluator:
             transform_config=self.transform_config,
             metric_type=self.metric_type,
         )
-        self.main_metric_name = f"{self.dataset_str}_accuracy"
+        if self.metric_type == ClassificationMetricType.WORST_GROUP_ACCURACY:
+            metric_suffix = self.metric_type.value
+        else:
+            metric_suffix = "accuracy"
+        self.main_metric_name = f"{self.dataset_str}_{metric_suffix}"
 
     @torch.no_grad()
     def _evaluate_linear_classifiers(
@@ -305,7 +356,13 @@ class Evaluator:
         logger.info("running validation !")
 
         num_classes = len(self.class_mapping) if self.class_mapping is not None else self.training_num_classes
-        metric = build_classification_metric(self.metric_type, num_classes=num_classes)
+        metric_kwargs = {}
+        if self.metric_type == ClassificationMetricType.WORST_GROUP_ACCURACY:
+            from dinov3.data.datasets.fmow import FMOW_REGION_NAMES
+
+            metric_kwargs["num_groups"] = len(FMOW_REGION_NAMES)
+            metric_kwargs["group_names"] = list(FMOW_REGION_NAMES)
+        metric = build_classification_metric(self.metric_type, num_classes=num_classes, **metric_kwargs)
         postprocessors = {
             k: LinearPostprocessor(v, self.class_mapping) for k, v in linear_classifiers.classifiers_dict.items()
         }
@@ -575,6 +632,10 @@ def train_linear_classifiers(
 
 
 def make_train_transform(config: TransformConfig):
+    if config.use_bio_transform:
+        return make_classification_train_bio_transform(
+            resize_size=config.resize_size, crop_size=config.crop_size,
+        )
     train_transform = make_classification_train_transform(crop_size=config.crop_size)
     return train_transform
 

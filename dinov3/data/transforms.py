@@ -144,6 +144,58 @@ def make_classification_eval_transform(
     )
 
 
+def make_classification_eval_bio_transform(
+    *,
+    resize_size: int = 0,
+    crop_size: int = CROP_DEFAULT_SIZE,
+    interpolation=v2.InterpolationMode.BICUBIC,
+) -> v2.Compose:
+    """Self-normalizing eval transform for multi-channel biological images.
+
+    Input is expected to already be a tensor (e.g. from ``PackedXChannelImageDecoder``).
+    ``resize_size <= 0`` skips the resize step.
+    """
+    from .transforms_bio import Div255, SelfNormalizeNoDiv
+
+    transforms_list = [Div255()]
+    if resize_size and resize_size > 0:
+        transforms_list.append(v2.Resize(resize_size, interpolation=interpolation))
+    if crop_size:
+        transforms_list.append(v2.CenterCrop(crop_size))
+    transforms_list.append(SelfNormalizeNoDiv())
+    transform = v2.Compose(transforms_list)
+    logger.info(f"Built bio eval transform\n{transform}")
+    return transform
+
+
+def make_classification_train_bio_transform(
+    *,
+    resize_size: int = 0,
+    crop_size: int = CROP_DEFAULT_SIZE,
+    interpolation=v2.InterpolationMode.BICUBIC,
+    hflip_prob: float = 0.5,
+    vflip_prob: float = 0.5,
+) -> v2.Compose:
+    """Self-normalizing train transform for multi-channel biological images.
+
+    Div255 → optional Resize → RandomCrop → flips → SelfNormalizeNoDiv.
+    """
+    from .transforms_bio import Div255, SelfNormalizeNoDiv
+
+    transforms_list = [Div255()]
+    if resize_size and resize_size > 0:
+        transforms_list.append(v2.Resize(resize_size, interpolation=interpolation))
+    transforms_list.append(v2.RandomCrop(crop_size))
+    if hflip_prob > 0.0:
+        transforms_list.append(v2.RandomHorizontalFlip(hflip_prob))
+    if vflip_prob > 0.0:
+        transforms_list.append(v2.RandomVerticalFlip(vflip_prob))
+    transforms_list.append(SelfNormalizeNoDiv())
+    transform = v2.Compose(transforms_list)
+    logger.info(f"Built bio train transform\n{transform}")
+    return transform
+
+
 def voc2007_classification_target_transform(label, n_categories=20):
     one_hot = torch.zeros(n_categories, dtype=int)
     for instance in label.instances:

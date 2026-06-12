@@ -8,6 +8,7 @@ from .classification import (
     ClassificationMetricType,
     MacroAveragedMeanReciprocalRank,
     MeanAveragePrecisionVOC2007,
+    WorstGroupAccuracy,
     accuracy,
     build_classification_metric,
     build_topk_accuracy_metric,

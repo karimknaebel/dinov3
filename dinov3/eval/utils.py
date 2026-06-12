@@ -121,15 +121,21 @@ def evaluate(
     accumulator_class = ResultsAccumulator if accumulate_results else NoOpAccumulator
     accumulators = {k: accumulator_class() for k in postprocessors.keys()}
 
-    # Dataset needs to be wrapped in fairvit.data.adapters.DatasetWithEnumeratedTargets
-    for samples, (index, targets), *_ in metric_logger.log_every(data_loader, 10, header):
-        samples, targets, index = samples[index >= 0], targets[index >= 0], index[index >= 0]
+    # Dataset needs to be wrapped in dinov3.data.adapters.DatasetWithEnumeratedTargets
+    # `*extra` picks up an optional per-sample groups tensor produced by collate fns
+    # like `_region_collate` (used for WORST_GROUP_ACCURACY).
+    for samples, (index, targets), *extra in metric_logger.log_every(data_loader, 10, header):
+        valid = index >= 0
+        samples, targets, index = samples[valid], targets[valid], index[valid]
+        groups = extra[0][valid] if extra else None
         if len(index) == 0:
             continue
 
         outputs = model(samples.to(device))
         index = index.to(device)
         targets = targets.to(device)
+        if groups is not None:
+            groups = groups.to(device)
 
         if criterion is not None:
             loss = criterion(outputs, targets)
@@ -137,6 +143,8 @@ def evaluate(
 
         for k, metric in metrics.items():
             metric_inputs = postprocessors[k](outputs, targets)
+            if groups is not None:
+                metric_inputs = {**metric_inputs, "groups": groups}
             metric.update(**metric_inputs)
             accumulators[k].update(preds=metric_inputs["preds"], target=metric_inputs["target"], index=index)
 
@@ -275,7 +283,11 @@ def save_results(
     """
     Helper to save predictions from a model and their associated targets, aligned by their index
     """
-    filename_suffix = "" if filename_suffix is None else f"_{filename_suffix}"
+    if filename_suffix is None:
+        filename_suffix = ""
+    else:
+        safe = filename_suffix.replace(":", "_").replace("/", "_")
+        filename_suffix = f"_{safe}"
     preds_filename = f"preds{filename_suffix}.npy"
     target_filename = f"target{filename_suffix}.npy"
     preds_path = os.path.join(output_dir, preds_filename)

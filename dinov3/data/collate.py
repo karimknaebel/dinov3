@@ -4,8 +4,52 @@
 # the terms of the DINOv3 License Agreement.
 
 import random
+from dataclasses import fields, is_dataclass
+from typing import Any
 
+import numpy as np
 import torch
+
+
+def _collate_metadata(metadata_list: list) -> Any:
+    """Collate a list of per-sample metadata dataclasses into one batched dataclass.
+
+    Each field is stacked into a tensor when numeric; non-numeric fields (str,
+    mixed tuples, etc.) are kept as a Python list. Returns ``None`` if the
+    samples don't carry a dataclass-typed metadata payload.
+    """
+    first = metadata_list[0]
+
+    if not is_dataclass(first):
+        return None
+
+    data_type = type(first)
+    collated = {}
+
+    for f in fields(first):
+        vals = [getattr(m, f.name) for m in metadata_list]
+
+        if vals[0] is None:
+            collated[f.name] = None
+        elif isinstance(vals[0], float):
+            arr = np.array(vals, dtype=np.float32)
+            collated[f.name] = torch.from_numpy(arr)
+        elif isinstance(vals[0], (int, np.integer)):
+            arr = np.array(vals)
+            collated[f.name] = torch.from_numpy(arr).to(torch.long)
+        elif isinstance(vals[0], (np.floating, np.ndarray)):
+            arr = np.array(vals)
+            if arr.dtype in (np.float32, np.float64):
+                collated[f.name] = torch.from_numpy(arr.astype(np.float32))
+            else:
+                collated[f.name] = torch.from_numpy(arr).to(torch.long)
+        elif isinstance(vals[0], tuple) and all(isinstance(v, (int, float)) for v in vals[0]):
+            arr = np.array(vals, dtype=np.float32)
+            collated[f.name] = torch.from_numpy(arr)
+        else:
+            collated[f.name] = vals
+
+    return data_type(**collated)
 
 
 def collate_data_and_cast(
@@ -18,6 +62,15 @@ def collate_data_and_cast(
     random_circular_shift=False,
     local_batch_size=None,
 ):
+    # Extract metadata when samples are shaped (transform_output, (target, metadata)).
+    # Standard 2-tuple samples (transform_output, target) leave metadata as None.
+    metadata = None
+    first_sample = samples_list[0]
+    if len(first_sample) > 1 and isinstance(first_sample[1], tuple) and len(first_sample[1]) > 1:
+        metadata_list = [s[1][1] for s in samples_list]
+        if metadata_list[0] is not None:
+            metadata = _collate_metadata(metadata_list)
+
     n_global_crops = len(samples_list[0][0]["global_crops"])
     n_local_crops = len(samples_list[0][0]["local_crops"])
 
@@ -72,6 +125,7 @@ def collate_data_and_cast(
         "masks_weight": masks_weight,
         "upperbound": upperbound,
         "n_masked_patches": torch.full((1,), fill_value=mask_indices_list.shape[0], dtype=torch.long),
+        "metadata": metadata,
     }
     if collated_gram_teacher_crops is not None:
         out["collated_gram_teacher_crops"] = collated_gram_teacher_crops.to(dtype)
@@ -121,5 +175,18 @@ def get_batch_subset(collated_data_batch, divide_by):
 
     if "global_batch_size" in collated_data_batch.keys():
         new_batch["global_batch_size"] = collated_data_batch["global_batch_size"] // divide_by
+
+    metadata = collated_data_batch.get("metadata")
+    if metadata is not None and is_dataclass(metadata):
+        subset_metadata = {}
+        for f in fields(metadata):
+            val = getattr(metadata, f.name)
+            if isinstance(val, torch.Tensor) and val.shape[0] == old_bs:
+                subset_metadata[f.name] = val[:target_bs]
+            else:
+                subset_metadata[f.name] = val
+        new_batch["metadata"] = type(metadata)(**subset_metadata)
+    elif metadata is not None:
+        new_batch["metadata"] = metadata
 
     return new_batch

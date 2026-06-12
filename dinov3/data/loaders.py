@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Optional, TypeVar
 import torch
 from torch.utils.data import Sampler
 
-from .datasets import ADE20K, CocoCaptions, ImageNet, ImageNet22k, NYU
+from .datasets import ADE20K, CocoCaptions, FMoW, HPAWholeHR, ImageNet, ImageNet22k, NYU
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
 
 logger = logging.getLogger("dinov3")
@@ -51,7 +51,7 @@ def _parse_dataset_str(dataset_str: str):
 
     for token in tokens[1:]:
         key, value = token.split("=")
-        assert key in ("root", "extra", "split")
+        assert key in ("root", "extra", "split", "with_metadata")
         kwargs[key] = value
 
     if name == "ImageNet":
@@ -72,6 +72,22 @@ def _parse_dataset_str(dataset_str: str):
         class_ = NYU
         if "split" in kwargs:
             kwargs["split"] = NYU.Split[kwargs["split"]]
+    elif name == "FMoW":
+        from .datasets.fmow import _Split
+
+        class_ = FMoW
+        if "split" in kwargs:
+            kwargs["split"] = _Split[kwargs["split"]]
+        if "with_metadata" in kwargs:
+            kwargs["with_metadata"] = kwargs["with_metadata"].lower() in ("true", "1", "yes")
+    elif name == "HPAWholeHR":
+        from .datasets.hpa_whole_hr import _Split
+
+        class_ = HPAWholeHR
+        if "split" in kwargs:
+            kwargs["split"] = _Split[kwargs["split"]]
+        if "with_metadata" in kwargs:
+            kwargs["with_metadata"] = kwargs["with_metadata"].lower() in ("true", "1", "yes")
     else:
         raise ValueError(f'Unsupported dataset "{name}"')
 

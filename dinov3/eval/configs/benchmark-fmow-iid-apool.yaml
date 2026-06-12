@@ -1,0 +1,53 @@
+# FMoW attention-pooling benchmark (crop 224 / resize 256, 1.14 ratio).
+#
+# Two evals: IID (val/test within year < 2013) and OOD (temporal shift,
+# train < 2013 / val 2013-2015 / test >= 2016).
+#
+# Selection uses WORST_GROUP_ACCURACY across the 6 FMoW regions (Africa,
+# Americas, Asia, Europe, Oceania, Unknown). Region groups come off
+# `_Metadata.region`; the eval wires them in via `_region_collate`.
+#
+# Run a single eval directly (no orchestrator):
+#
+#   PYTHONPATH=${PWD} python -m dinov3.run.submit dinov3/eval/attention_pooling.py \
+#       --config-file dinov3/eval/configs/benchmark-fmow-iid-apool.yaml \
+#       --output-dir <PATH/TO/OUTPUT/DIR> \
+#       model.config_file=<TRAIN/OUTPUT>/config.yaml \
+#       model.pretrained_weights=<TRAIN/OUTPUT>/eval/<ITER>/teacher_checkpoint.pth
+
+train:
+  dataset: "FMoW:split=TRAIN"
+  val_dataset: "FMoW:split=VAL_ID"
+  batch_size: 32
+  optimizer_type: ADAMW
+  loss_type: CROSS_ENTROPY
+  epoch_length: 300
+  epochs: 5
+  n_last_blocks_list:
+    - 4
+  cls_patch: false
+  embed_dim: 512
+  num_heads: 8
+  learning_rates:
+    - 1.0e-4
+    - 5.0e-4
+    - 1.0e-3
+    - 5.0e-3
+    - 1.0e-2
+    - 5.0e-2
+    - 0.1
+    - 0.5
+    - 1.0
+  val_metric_type: WORST_GROUP_ACCURACY
+
+eval:
+  test_datasets:
+    - "FMoW:split=TEST_ID"
+  test_metric_types:
+    - WORST_GROUP_ACCURACY
+
+transform:
+  resize_size: 256
+  crop_size: 224
+
+save_results: true

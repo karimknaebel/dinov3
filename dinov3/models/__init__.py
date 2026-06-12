@@ -37,6 +37,7 @@ def build_model(args, only_teacher=False, img_size=224, device=None):
         vit_kwargs = dict(
             img_size=img_size,
             patch_size=args.patch_size,
+            in_chans=args.in_chans,
             pos_embed_rope_base=args.pos_embed_rope_base,
             pos_embed_rope_min_period=args.pos_embed_rope_min_period,
             pos_embed_rope_max_period=args.pos_embed_rope_max_period,

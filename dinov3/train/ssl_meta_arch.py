@@ -17,7 +17,7 @@ from dinov3.configs import get_default_config
 from dinov3.data import DataAugmentationDINO
 from dinov3.fsdp.ac_compile_parallelize import ac_compile_parallelize
 from dinov3.layers.dino_head import DINOHead
-from dinov3.loss import DINOLoss, GramLoss, KoLeoLoss, KoLeoLossDistributed, iBOTPatchLoss
+from dinov3.loss import DINOLoss, DistributedSIGReg, GramLoss, KoLeoLoss, KoLeoLossDistributed, iBOTPatchLoss
 from dinov3.models import build_model_from_cfg
 from dinov3.train.cosine_lr_scheduler import linear_warmup_cosine_decay
 from dinov3.train.param_groups import fuse_params_groups, get_params_groups_with_decay_fsdp
@@ -99,6 +99,24 @@ class SSLMetaArch(nn.Module):
         else:
             assert cfg.dino.koleo_topk == 1, "Non-distributed KoLeo loss only supports `dino.koleo_topk=1`"
             self.koleo_loss = KoLeoLoss()
+
+        sigreg_cfg = getattr(cfg, "sigreg", None)
+        self.sigreg_enabled = sigreg_cfg is not None and sigreg_cfg.enabled
+        if self.sigreg_enabled:
+            mode = sigreg_cfg.mode
+            assert mode == "bottleneck", f"Only sigreg.mode='bottleneck' is supported (got '{mode}')."
+            self.sigreg_mode = mode
+            self.sigreg_loss = DistributedSIGReg(
+                num_slices=sigreg_cfg.num_slices,
+                range_max=sigreg_cfg.range_max,
+                n_knots=sigreg_cfg.n_knots,
+            )
+            self.sigreg_loss_weight = sigreg_cfg.loss_weight
+            self.sigreg_koleo_too = sigreg_cfg.koleo_too
+            logger.info(
+                f"OPTIONS -- SIGREG: enabled, mode={mode}, weight={self.sigreg_loss_weight}, "
+                f"num_slices={sigreg_cfg.num_slices}, koleo_too={self.sigreg_koleo_too}"
+            )
 
         logger.info("OPTIONS -- IBOT")
         logger.info(f"OPTIONS -- IBOT -- loss_weight: {cfg.ibot.loss_weight}")
@@ -304,6 +322,8 @@ class SSLMetaArch(nn.Module):
         self.student.ibot_head.init_weights()
         self.dino_loss.init_weights()
         self.ibot_patch_loss.init_weights()
+        if self.sigreg_enabled:
+            self.sigreg_loss.reset_buffers()
         self.model_ema.load_state_dict(self.student.state_dict())
         if self.has_gram_teacher:
             if self.gram_ckpt is not None:
@@ -561,7 +581,12 @@ class SSLMetaArch(nn.Module):
         ]
         sizes = [x.shape[0] for x in buffer]
         buffer = torch.cat(buffer, dim=0)  # [n_global_crops * B + n_local_crops * B, D]
-        buffer = self.student.dino_head(buffer)  # [n_global_crops * B + n_local_crops * B, K]
+        bottleneck = None
+        if self.sigreg_enabled and self.sigreg_mode == "bottleneck":
+            buffer, bottleneck = self.student.dino_head(buffer, return_bottleneck=True)
+            bottleneck = torch.split_with_sizes(bottleneck, sizes, dim=0)
+        else:
+            buffer = self.student.dino_head(buffer)  # [n_global_crops * B + n_local_crops * B, K]
         buffer = torch.split_with_sizes(buffer, sizes, dim=0)
 
         global_out = {
@@ -572,6 +597,8 @@ class SSLMetaArch(nn.Module):
             "masked_patch_after_head": global_masked_patch_after_head,  # [n_masked_patches, K]
             "masked_patch_pre_head": masked_patches_pre_head,  # [n_masked_patches, D]
         }
+        if bottleneck is not None:
+            global_out["bottleneck_pre_norm"] = bottleneck[0].unflatten(0, [n_global_crops, B])
         local_out = {
             "cls_pre_head": l_cls.unflatten(0, [n_local_crops, B]),  # [n_local_crops, B, D]
             "reg_pre_head": l_reg.unflatten(0, [n_local_crops, B]),  # [n_local_crops, B, R, D]
@@ -633,9 +660,20 @@ class SSLMetaArch(nn.Module):
         loss_accumulator += self.dino_loss_weight * dino_global_scale * dino_global_crops_loss
 
         # Koleo: regularize pre-head CLS tokens of student(global crops)
-        koleo_loss = sum(self.koleo_loss(x) for x in student_global["cls_pre_head"]) / n_global_crops
-        loss_dict["koleo_loss"] = koleo_loss
-        loss_accumulator += self.dino_koleo_loss_weight * koleo_scale * koleo_loss
+        if self.sigreg_enabled:
+            sigreg_features = student_global["bottleneck_pre_norm"]
+            sigreg_loss = sum(self.sigreg_loss(x, seed_step=iteration) for x in sigreg_features) / n_global_crops
+            loss_dict["sigreg_loss"] = sigreg_loss
+            loss_accumulator += self.sigreg_loss_weight * koleo_scale * sigreg_loss
+
+            if self.sigreg_koleo_too:
+                koleo_loss = sum(self.koleo_loss(x) for x in student_global["cls_pre_head"]) / n_global_crops
+                loss_dict["koleo_loss"] = koleo_loss
+                loss_accumulator += self.dino_koleo_loss_weight * koleo_scale * koleo_loss
+        else:
+            koleo_loss = sum(self.koleo_loss(x) for x in student_global["cls_pre_head"]) / n_global_crops
+            loss_dict["koleo_loss"] = koleo_loss
+            loss_accumulator += self.dino_koleo_loss_weight * koleo_scale * koleo_loss
 
         # IBOT loss
         ibot_patch_loss = self.ibot_patch_loss.forward_masked(
@@ -756,8 +794,35 @@ class SSLMetaArch(nn.Module):
             local_crops_subset_of_global_crops=cfg.crops.localcrops_subset_of_globalcrops,
             share_color_jitter=cfg.crops.share_color_jitter,
             horizontal_flips=cfg.crops.horizontal_flips,
+            vertical_flips=cfg.crops.vertical_flips,
+            gaussian_blur=cfg.crops.gaussian_blur,
             mean=cfg.crops.rgb_mean,
             std=cfg.crops.rgb_std,
+            cell_augmentation_type=getattr(cfg.train, "cell_augmentation_type", None),
+        )
+
+    def is_student_frozen(self, iteration: int) -> bool:
+        """True while iteration < cfg.schedules.lr.freeze_student_iterations.
+
+        Drives two-stage finetuning: backbone params flagged
+        ``is_frozen_backbone`` have their LR zeroed by ``apply_optim_scheduler``
+        while this returns True. Defaults to False when the knob is missing
+        (i.e. configs that don't opt in to two-stage training).
+        """
+        schedules_lr = getattr(getattr(self.cfg, "schedules", None), "lr", None)
+        freeze_iters = getattr(schedules_lr, "freeze_student_iterations", 0) if schedules_lr is not None else 0
+        return freeze_iters > 0 and iteration < freeze_iters
+
+    def _freeze_knobs(self) -> dict:
+        """Read freeze gates off cfg.schedules.lr with backward-compat fallbacks."""
+        schedules_lr = getattr(getattr(self.cfg, "schedules", None), "lr", None)
+        if schedules_lr is None:
+            return {}
+        return dict(
+            freeze_patch_embed=getattr(schedules_lr, "freeze_patch_embed", True),
+            freeze_cls_token=getattr(schedules_lr, "freeze_cls_token", True),
+            freeze_mask_token=getattr(schedules_lr, "freeze_mask_token", True),
+            unfreeze_last_n_blocks=getattr(schedules_lr, "unfreeze_last_n_blocks", 0),
         )
 
     def get_maybe_fused_params_for_submodel(self, m: nn.Module):
@@ -766,6 +831,7 @@ class SSLMetaArch(nn.Module):
             lr_decay_rate=self.cfg.optim.layerwise_decay,
             patch_embed_lr_mult=self.cfg.optim.patch_embed_lr_mult,
             dino_head_wd_multiplier=self.cfg.optim.dino_head_wd_multiplier,
+            **self._freeze_knobs(),
         )
         if self.cfg.optim.multi_tensor_optim:
             fused_params_groups = fuse_params_groups(params_groups)

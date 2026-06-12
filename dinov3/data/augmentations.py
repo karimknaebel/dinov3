@@ -11,6 +11,14 @@ from torch import nn
 from torchvision.transforms import v2
 
 from dinov3.data.transforms import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, GaussianBlur, make_normalize_transform
+from dinov3.data.transforms_bio import (
+    Div255,
+    RandomBrightness,
+    RandomContrast,
+    RandomContrastProteinChannel,
+    RandomRemoveChannelExceptProtein,
+    SelfNormalizeNoDiv,
+)
 
 logger = logging.getLogger("dinov3")
 
@@ -30,8 +38,11 @@ class DataAugmentationDINO(object):
         patch_size=16,
         share_color_jitter=False,
         horizontal_flips=True,
+        vertical_flips=False,
+        gaussian_blur=True,
         mean=IMAGENET_DEFAULT_MEAN,
         std=IMAGENET_DEFAULT_STD,
+        cell_augmentation_type=None,
     ):
         self.global_crops_scale = global_crops_scale
         self.local_crops_scale = local_crops_scale
@@ -61,6 +72,9 @@ class DataAugmentationDINO(object):
         logger.info(f"patch_size if local_crops_subset_of_global_crops: {patch_size}")
         logger.info(f"share_color_jitter: {share_color_jitter}")
         logger.info(f"horizontal flips: {horizontal_flips}")
+        logger.info(f"vertical flips: {vertical_flips}")
+        logger.info(f"gaussian blur: {gaussian_blur}")
+        logger.info(f"cell_augmentation_type: {cell_augmentation_type}")
         logger.info("###################################")
 
         # Global crops and gram teacher crops can have different sizes. We first take a crop of the maximum size
@@ -76,6 +90,7 @@ class DataAugmentationDINO(object):
                     interpolation=v2.InterpolationMode.BICUBIC,
                 ),
                 v2.RandomHorizontalFlip(p=0.5 if horizontal_flips else 0.0),
+                v2.RandomVerticalFlip(p=0.5 if vertical_flips else 0.0),
             ]
         )
 
@@ -115,39 +130,61 @@ class DataAugmentationDINO(object):
                     interpolation=v2.InterpolationMode.BICUBIC,
                 ),
                 v2.RandomHorizontalFlip(p=0.5 if horizontal_flips else 0.0),
+                v2.RandomVerticalFlip(p=0.5 if vertical_flips else 0.0),
             ]
         )
 
         # color distortions / blurring
-        color_jittering = v2.Compose(
-            [
-                v2.RandomApply(
-                    [v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
-                    p=0.8,
-                ),
-                v2.RandomGrayscale(p=0.2),
-            ]
-        )
+        if cell_augmentation_type == "hpa":
+            color_jittering = v2.Compose(
+                [
+                    RandomContrastProteinChannel(p=0.2),
+                    RandomRemoveChannelExceptProtein(p=0.2),
+                    RandomContrast(p=0.2),
+                    RandomBrightness(p=0.2),
+                ]
+            )
+        else:
+            color_jittering = v2.Compose(
+                [
+                    v2.RandomApply(
+                        [v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
+                        p=0.8,
+                    ),
+                    v2.RandomGrayscale(p=0.2),
+                ]
+            )
 
-        global_transfo1_extra = GaussianBlur(p=1.0)
-
-        global_transfo2_extra = v2.Compose(
-            [
-                GaussianBlur(p=0.1),
-                v2.RandomSolarize(threshold=128, p=0.2),
-            ]
-        )
-
-        local_transfo_extra = GaussianBlur(p=0.5)
+        if gaussian_blur:
+            global_transfo1_extra = GaussianBlur(p=1.0)
+            global_transfo2_extra = v2.Compose(
+                [
+                    GaussianBlur(p=0.1),
+                    v2.RandomSolarize(threshold=128, p=0.2),
+                ]
+            )
+            local_transfo_extra = GaussianBlur(p=0.5)
+        else:
+            global_transfo1_extra = nn.Identity()
+            global_transfo2_extra = nn.Identity()
+            local_transfo_extra = nn.Identity()
 
         # normalization
-        self.normalize = v2.Compose(
-            [
-                v2.ToImage(),
-                v2.ToDtype(torch.float32, scale=True),
-                make_normalize_transform(mean=mean, std=std),
-            ]
-        )
+        if cell_augmentation_type == "hpa":
+            self.normalize = v2.Compose(
+                [
+                    Div255(),
+                    SelfNormalizeNoDiv(),
+                ]
+            )
+        else:
+            self.normalize = v2.Compose(
+                [
+                    v2.ToImage(),
+                    v2.ToDtype(torch.float32, scale=True),
+                    make_normalize_transform(mean=mean, std=std),
+                ]
+            )
 
         if self.share_color_jitter:
             self.color_jittering = color_jittering
