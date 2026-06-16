@@ -4,12 +4,17 @@
 # the terms of the DINOv3 License Agreement.
 
 import os
+import logging
 from enum import Enum
 from typing import List, Optional, Union
 from urllib.parse import urlparse
 from pathlib import Path
 
+import torch
+
 from .utils import _DINOV3_BASE_URL, _safe_load_state_dict_from_url
+
+logger = logging.getLogger("dinov3")
 
 
 class Weights(Enum):
@@ -136,7 +141,16 @@ def _make_dinov3_vit(
         else:
             url = convert_path_or_url_to_url(weights)
         state_dict = _safe_load_state_dict_from_url(url, map_location="cpu", check_hash=check_hash)
-        model.load_state_dict(state_dict, strict=True)
+        checkpoint_periods = state_dict["rope_embed.periods"]
+        model_periods = model.rope_embed.periods.to(device=checkpoint_periods.device, dtype=checkpoint_periods.dtype)
+        if checkpoint_periods.shape != model_periods.shape or not torch.allclose(checkpoint_periods, model_periods):
+            logger.warning("Checkpoint RoPE periods differ from configured periods; using configured periods")
+            state_dict.pop("rope_embed.periods")
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+            assert missing_keys == ["rope_embed.periods"]
+            assert unexpected_keys == []
+        else:
+            model.load_state_dict(state_dict, strict=True)
     else:
         model.init_weights()
     return model
@@ -171,15 +185,18 @@ def _make_dinov3_convnext(
 ):
     from ..models.convnext import ConvNeXt
 
-    model_kwargs = dict(
-        in_chans=in_chans,
-        depths=depths,
-        dims=dims,
-        drop_path_rate=drop_path_rate,
-        layer_scale_init_value=layer_scale_init_value,
+    model = ConvNeXt(
+        **(
+            dict(
+                in_chans=in_chans,
+                depths=depths,
+                dims=dims,
+                drop_path_rate=drop_path_rate,
+                layer_scale_init_value=layer_scale_init_value,
+            )
+            | kwargs
+        )
     )
-    model_kwargs.update(**kwargs)
-    model = ConvNeXt(**model_kwargs)
     if pretrained:
         if type(weights) is Weights and weights not in {Weights.LVD1689M, Weights.SAT493M}:
             raise ValueError(f"Unsupported weights for the backbone: {weights}")
@@ -205,33 +222,37 @@ def dinov3_vits16(
 ):
     if "hash" not in kwargs:
         kwargs["hash"] = "08c60483"
-    kwargs["version"] = None
+    kwargs.setdefault("version", None)
     return _make_dinov3_vit(
-        img_size=224,
-        patch_size=16,
-        in_chans=3,
-        pos_embed_rope_base=100,
-        pos_embed_rope_normalize_coords="separate",
-        pos_embed_rope_rescale_coords=2,
-        pos_embed_rope_dtype="fp32",
-        embed_dim=384,
-        depth=12,
-        num_heads=6,
-        ffn_ratio=4,
-        qkv_bias=True,
-        drop_path_rate=0.0,
-        layerscale_init=1.0e-05,
-        norm_layer="layernormbf16",
-        ffn_layer="mlp",
-        ffn_bias=True,
-        proj_bias=True,
-        n_storage_tokens=4,
-        mask_k_bias=True,
-        pretrained=pretrained,
-        weights=weights,
-        compact_arch_name="vits",
-        check_hash=check_hash,
-        **kwargs,
+        **(
+            dict(
+                img_size=224,
+                patch_size=16,
+                in_chans=3,
+                pos_embed_rope_base=100,
+                pos_embed_rope_normalize_coords="separate",
+                pos_embed_rope_rescale_coords=2,
+                pos_embed_rope_dtype="fp32",
+                embed_dim=384,
+                depth=12,
+                num_heads=6,
+                ffn_ratio=4,
+                qkv_bias=True,
+                drop_path_rate=0.0,
+                layerscale_init=1.0e-05,
+                norm_layer="layernormbf16",
+                ffn_layer="mlp",
+                ffn_bias=True,
+                proj_bias=True,
+                n_storage_tokens=4,
+                mask_k_bias=True,
+                pretrained=pretrained,
+                weights=weights,
+                compact_arch_name="vits",
+                check_hash=check_hash,
+            )
+            | kwargs
+        ),
     )
 
 
@@ -244,33 +265,37 @@ def dinov3_vits16plus(
 ):
     if "hash" not in kwargs:
         kwargs["hash"] = "4057cbaa"
-    kwargs["version"] = None
+    kwargs.setdefault("version", None)
     return _make_dinov3_vit(
-        img_size=224,
-        patch_size=16,
-        in_chans=3,
-        pos_embed_rope_base=100,
-        pos_embed_rope_normalize_coords="separate",
-        pos_embed_rope_rescale_coords=2,
-        pos_embed_rope_dtype="fp32",
-        embed_dim=384,
-        depth=12,
-        num_heads=6,
-        ffn_ratio=6,
-        qkv_bias=True,
-        drop_path_rate=0.0,
-        layerscale_init=1.0e-05,
-        norm_layer="layernormbf16",
-        ffn_layer="swiglu",
-        ffn_bias=True,
-        proj_bias=True,
-        n_storage_tokens=4,
-        mask_k_bias=True,
-        pretrained=pretrained,
-        weights=weights,
-        compact_arch_name="vitsplus",
-        check_hash=check_hash,
-        **kwargs,
+        **(
+            dict(
+                img_size=224,
+                patch_size=16,
+                in_chans=3,
+                pos_embed_rope_base=100,
+                pos_embed_rope_normalize_coords="separate",
+                pos_embed_rope_rescale_coords=2,
+                pos_embed_rope_dtype="fp32",
+                embed_dim=384,
+                depth=12,
+                num_heads=6,
+                ffn_ratio=6,
+                qkv_bias=True,
+                drop_path_rate=0.0,
+                layerscale_init=1.0e-05,
+                norm_layer="layernormbf16",
+                ffn_layer="swiglu",
+                ffn_bias=True,
+                proj_bias=True,
+                n_storage_tokens=4,
+                mask_k_bias=True,
+                pretrained=pretrained,
+                weights=weights,
+                compact_arch_name="vitsplus",
+                check_hash=check_hash,
+            )
+            | kwargs
+        ),
     )
 
 
@@ -283,33 +308,37 @@ def dinov3_vitb16(
 ):
     if "hash" not in kwargs:
         kwargs["hash"] = "73cec8be"
-    kwargs["version"] = None
+    kwargs.setdefault("version", None)
     return _make_dinov3_vit(
-        img_size=224,
-        patch_size=16,
-        in_chans=3,
-        pos_embed_rope_base=100,
-        pos_embed_rope_normalize_coords="separate",
-        pos_embed_rope_rescale_coords=2,
-        pos_embed_rope_dtype="fp32",
-        embed_dim=768,
-        depth=12,
-        num_heads=12,
-        ffn_ratio=4,
-        qkv_bias=True,
-        drop_path_rate=0.0,
-        layerscale_init=1.0e-05,
-        norm_layer="layernormbf16",
-        ffn_layer="mlp",
-        ffn_bias=True,
-        proj_bias=True,
-        n_storage_tokens=4,
-        mask_k_bias=True,
-        pretrained=pretrained,
-        weights=weights,
-        compact_arch_name="vitb",
-        check_hash=check_hash,
-        **kwargs,
+        **(
+            dict(
+                img_size=224,
+                patch_size=16,
+                in_chans=3,
+                pos_embed_rope_base=100,
+                pos_embed_rope_normalize_coords="separate",
+                pos_embed_rope_rescale_coords=2,
+                pos_embed_rope_dtype="fp32",
+                embed_dim=768,
+                depth=12,
+                num_heads=12,
+                ffn_ratio=4,
+                qkv_bias=True,
+                drop_path_rate=0.0,
+                layerscale_init=1.0e-05,
+                norm_layer="layernormbf16",
+                ffn_layer="mlp",
+                ffn_bias=True,
+                proj_bias=True,
+                n_storage_tokens=4,
+                mask_k_bias=True,
+                pretrained=pretrained,
+                weights=weights,
+                compact_arch_name="vitb",
+                check_hash=check_hash,
+            )
+            | kwargs
+        ),
     )
 
 
@@ -338,34 +367,38 @@ def dinov3_vitl16(
         hash = matches[0]
         if hash == "eadcf0ff":
             untie_global_and_local_cls_norm = True
-    kwargs["version"] = None
+    kwargs.setdefault("version", None)
     return _make_dinov3_vit(
-        img_size=224,
-        patch_size=16,
-        in_chans=3,
-        pos_embed_rope_base=100,
-        pos_embed_rope_normalize_coords="separate",
-        pos_embed_rope_rescale_coords=2,
-        pos_embed_rope_dtype="fp32",
-        embed_dim=1024,
-        depth=24,
-        num_heads=16,
-        ffn_ratio=4,
-        qkv_bias=True,
-        drop_path_rate=0.0,
-        layerscale_init=1.0e-05,
-        norm_layer="layernormbf16",
-        ffn_layer="mlp",
-        ffn_bias=True,
-        proj_bias=True,
-        n_storage_tokens=4,
-        mask_k_bias=True,
-        untie_global_and_local_cls_norm=untie_global_and_local_cls_norm,
-        pretrained=pretrained,
-        weights=weights,
-        compact_arch_name="vitl",
-        check_hash=check_hash,
-        **kwargs,
+        **(
+            dict(
+                img_size=224,
+                patch_size=16,
+                in_chans=3,
+                pos_embed_rope_base=100,
+                pos_embed_rope_normalize_coords="separate",
+                pos_embed_rope_rescale_coords=2,
+                pos_embed_rope_dtype="fp32",
+                embed_dim=1024,
+                depth=24,
+                num_heads=16,
+                ffn_ratio=4,
+                qkv_bias=True,
+                drop_path_rate=0.0,
+                layerscale_init=1.0e-05,
+                norm_layer="layernormbf16",
+                ffn_layer="mlp",
+                ffn_bias=True,
+                proj_bias=True,
+                n_storage_tokens=4,
+                mask_k_bias=True,
+                untie_global_and_local_cls_norm=untie_global_and_local_cls_norm,
+                pretrained=pretrained,
+                weights=weights,
+                compact_arch_name="vitl",
+                check_hash=check_hash,
+            )
+            | kwargs
+        ),
     )
 
 
@@ -380,31 +413,35 @@ def dinov3_vitl16plus(
         kwargs["hash"] = "46503df0"
 
     return _make_dinov3_vit(
-        img_size=224,
-        patch_size=16,
-        in_chans=3,
-        pos_embed_rope_base=100,
-        pos_embed_rope_normalize_coords="separate",
-        pos_embed_rope_rescale_coords=2,
-        pos_embed_rope_dtype="fp32",
-        embed_dim=1024,
-        depth=24,
-        num_heads=16,
-        ffn_ratio=6.0,
-        qkv_bias=True,
-        drop_path_rate=0.0,
-        layerscale_init=1.0e-05,
-        norm_layer="layernormbf16",
-        ffn_layer="swiglu",
-        ffn_bias=True,
-        proj_bias=True,
-        n_storage_tokens=4,
-        mask_k_bias=True,
-        pretrained=pretrained,
-        weights=weights,
-        compact_arch_name="vitlplus",
-        check_hash=check_hash,
-        **kwargs,
+        **(
+            dict(
+                img_size=224,
+                patch_size=16,
+                in_chans=3,
+                pos_embed_rope_base=100,
+                pos_embed_rope_normalize_coords="separate",
+                pos_embed_rope_rescale_coords=2,
+                pos_embed_rope_dtype="fp32",
+                embed_dim=1024,
+                depth=24,
+                num_heads=16,
+                ffn_ratio=6.0,
+                qkv_bias=True,
+                drop_path_rate=0.0,
+                layerscale_init=1.0e-05,
+                norm_layer="layernormbf16",
+                ffn_layer="swiglu",
+                ffn_bias=True,
+                proj_bias=True,
+                n_storage_tokens=4,
+                mask_k_bias=True,
+                pretrained=pretrained,
+                weights=weights,
+                compact_arch_name="vitlplus",
+                check_hash=check_hash,
+            )
+            | kwargs
+        ),
     )
 
 
@@ -419,31 +456,35 @@ def dinov3_vith16plus(
         kwargs["hash"] = "7c1da9a5"
 
     return _make_dinov3_vit(
-        img_size=224,
-        patch_size=16,
-        in_chans=3,
-        pos_embed_rope_base=100,
-        pos_embed_rope_normalize_coords="separate",
-        pos_embed_rope_rescale_coords=2,
-        pos_embed_rope_dtype="fp32",
-        embed_dim=1280,
-        depth=32,
-        num_heads=20,
-        ffn_ratio=6.0,
-        qkv_bias=True,
-        drop_path_rate=0.0,
-        layerscale_init=1.0e-05,
-        norm_layer="layernormbf16",
-        ffn_layer="swiglu",
-        ffn_bias=True,
-        proj_bias=True,
-        n_storage_tokens=4,
-        mask_k_bias=True,
-        pretrained=pretrained,
-        weights=weights,
-        compact_arch_name="vithplus",
-        check_hash=check_hash,
-        **kwargs,
+        **(
+            dict(
+                img_size=224,
+                patch_size=16,
+                in_chans=3,
+                pos_embed_rope_base=100,
+                pos_embed_rope_normalize_coords="separate",
+                pos_embed_rope_rescale_coords=2,
+                pos_embed_rope_dtype="fp32",
+                embed_dim=1280,
+                depth=32,
+                num_heads=20,
+                ffn_ratio=6.0,
+                qkv_bias=True,
+                drop_path_rate=0.0,
+                layerscale_init=1.0e-05,
+                norm_layer="layernormbf16",
+                ffn_layer="swiglu",
+                ffn_bias=True,
+                proj_bias=True,
+                n_storage_tokens=4,
+                mask_k_bias=True,
+                pretrained=pretrained,
+                weights=weights,
+                compact_arch_name="vithplus",
+                check_hash=check_hash,
+            )
+            | kwargs
+        ),
     )
 
 
@@ -460,35 +501,39 @@ def dinov3_vit7b16(
     elif weights == Weights.SAT493M:
         if "hash" not in kwargs:
             kwargs["hash"] = "a6675841"
-    kwargs["version"] = None
+    kwargs.setdefault("version", None)
     untie_global_and_local_cls_norm = True
     return _make_dinov3_vit(
-        img_size=224,
-        patch_size=16,
-        in_chans=3,
-        pos_embed_rope_base=100,
-        pos_embed_rope_normalize_coords="separate",
-        pos_embed_rope_rescale_coords=2,
-        pos_embed_rope_dtype="fp32",
-        embed_dim=4096,
-        depth=40,
-        num_heads=32,
-        ffn_ratio=3,
-        qkv_bias=False,
-        drop_path_rate=0.0,
-        layerscale_init=1.0e-05,
-        norm_layer="layernormbf16",
-        ffn_layer="swiglu64",
-        ffn_bias=True,
-        proj_bias=True,
-        n_storage_tokens=4,
-        mask_k_bias=True,
-        untie_global_and_local_cls_norm=untie_global_and_local_cls_norm,
-        pretrained=pretrained,
-        weights=weights,
-        compact_arch_name="vit7b",
-        check_hash=check_hash,
-        **kwargs,
+        **(
+            dict(
+                img_size=224,
+                patch_size=16,
+                in_chans=3,
+                pos_embed_rope_base=100,
+                pos_embed_rope_normalize_coords="separate",
+                pos_embed_rope_rescale_coords=2,
+                pos_embed_rope_dtype="fp32",
+                embed_dim=4096,
+                depth=40,
+                num_heads=32,
+                ffn_ratio=3,
+                qkv_bias=False,
+                drop_path_rate=0.0,
+                layerscale_init=1.0e-05,
+                norm_layer="layernormbf16",
+                ffn_layer="swiglu64",
+                ffn_bias=True,
+                proj_bias=True,
+                n_storage_tokens=4,
+                mask_k_bias=True,
+                untie_global_and_local_cls_norm=untie_global_and_local_cls_norm,
+                pretrained=pretrained,
+                weights=weights,
+                compact_arch_name="vit7b",
+                check_hash=check_hash,
+            )
+            | kwargs
+        ),
     )
 
 
@@ -507,15 +552,19 @@ def dinov3_convnext_tiny(
     size_dict = convnext_sizes["tiny"]
 
     model = _make_dinov3_convnext(
-        in_chans=3,
-        depths=size_dict["depths"],
-        dims=size_dict["dims"],
-        compact_arch_name="convnext_tiny",
-        drop_path_rate=0,
-        layer_scale_init_value=1e-6,
-        pretrained=pretrained,
-        weights=weights,
-        **kwargs,
+        **(
+            dict(
+                in_chans=3,
+                depths=size_dict["depths"],
+                dims=size_dict["dims"],
+                compact_arch_name="convnext_tiny",
+                drop_path_rate=0,
+                layer_scale_init_value=1e-6,
+                pretrained=pretrained,
+                weights=weights,
+            )
+            | kwargs
+        ),
     )
     if not pretrained:
         model.init_weights()
@@ -537,15 +586,19 @@ def dinov3_convnext_small(
     size_dict = convnext_sizes["small"]
 
     model = _make_dinov3_convnext(
-        in_chans=3,
-        depths=size_dict["depths"],
-        dims=size_dict["dims"],
-        compact_arch_name="convnext_small",
-        drop_path_rate=0,
-        layer_scale_init_value=1e-6,
-        pretrained=pretrained,
-        weights=weights,
-        **kwargs,
+        **(
+            dict(
+                in_chans=3,
+                depths=size_dict["depths"],
+                dims=size_dict["dims"],
+                compact_arch_name="convnext_small",
+                drop_path_rate=0,
+                layer_scale_init_value=1e-6,
+                pretrained=pretrained,
+                weights=weights,
+            )
+            | kwargs
+        ),
     )
     if not pretrained:
         model.init_weights()
@@ -567,15 +620,19 @@ def dinov3_convnext_base(
     size_dict = convnext_sizes["base"]
 
     model = _make_dinov3_convnext(
-        in_chans=3,
-        depths=size_dict["depths"],
-        dims=size_dict["dims"],
-        compact_arch_name="convnext_base",
-        drop_path_rate=0,
-        layer_scale_init_value=1e-6,
-        pretrained=pretrained,
-        weights=weights,
-        **kwargs,
+        **(
+            dict(
+                in_chans=3,
+                depths=size_dict["depths"],
+                dims=size_dict["dims"],
+                compact_arch_name="convnext_base",
+                drop_path_rate=0,
+                layer_scale_init_value=1e-6,
+                pretrained=pretrained,
+                weights=weights,
+            )
+            | kwargs
+        ),
     )
     if not pretrained:
         model.init_weights()
@@ -597,15 +654,19 @@ def dinov3_convnext_large(
     size_dict = convnext_sizes["large"]
 
     model = _make_dinov3_convnext(
-        in_chans=3,
-        depths=size_dict["depths"],
-        dims=size_dict["dims"],
-        compact_arch_name="convnext_large",
-        drop_path_rate=0,
-        layer_scale_init_value=1e-6,
-        pretrained=pretrained,
-        weights=weights,
-        **kwargs,
+        **(
+            dict(
+                in_chans=3,
+                depths=size_dict["depths"],
+                dims=size_dict["dims"],
+                compact_arch_name="convnext_large",
+                drop_path_rate=0,
+                layer_scale_init_value=1e-6,
+                pretrained=pretrained,
+                weights=weights,
+            )
+            | kwargs
+        ),
     )
     if not pretrained:
         model.init_weights()
